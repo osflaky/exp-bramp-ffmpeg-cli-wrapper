@@ -1,0 +1,167 @@
+package net.bramp.ffmpeg;
+
+import static java.util.concurrent.TimeUnit.HOURS;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static java.util.concurrent.TimeUnit.MINUTES;
+import static java.util.concurrent.TimeUnit.SECONDS;
+import static net.bramp.ffmpeg.Preconditions.checkNotEmpty;
+
+import com.google.common.base.CharMatcher;
+import com.google.errorprone.annotations.InlineMe;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import net.bramp.commons.lang3.math.gson.FractionAdapter;
+import net.bramp.ffmpeg.adapter.FFmpegPacketsAndFramesAdapter;
+import net.bramp.ffmpeg.adapter.FFmpegStreamSideDataAdapter;
+import net.bramp.ffmpeg.gson.LowercaseEnumTypeAdapterFactory;
+import net.bramp.ffmpeg.probe.FFmpegFrameOrPacket;
+import net.bramp.ffmpeg.probe.FFmpegStream;
+import org.apache.commons.lang3.math.Fraction;
+
+/** Helper class with commonly used methods. */
+public final class FFmpegUtils {
+
+  static final Gson gson = FFmpegUtils.setupGson();
+  static final Pattern BITRATE_REGEX = Pattern.compile("(\\d+(?:\\.\\d+)?)kbits/s");
+  static final Pattern TIME_REGEX = Pattern.compile("(-?)(\\d+):(\\d+):(\\d+(?:\\.\\d+)?)");
+  static final CharMatcher ZERO = CharMatcher.is('0');
+
+  FFmpegUtils() {
+    throw new AssertionError("No instances for you!");
+  }
+
+  /**
+   * Convert milliseconds to "hh:mm:ss.ms" String representation.
+   *
+   * @param milliseconds time duration in milliseconds
+   * @return time duration in human-readable format
+   * @deprecated please use #toTimecode() instead.
+   */
+  @Deprecated
+  @InlineMe(
+      replacement = "FFmpegUtils.toTimecode(milliseconds, MILLISECONDS)",
+      imports = "net.bramp.ffmpeg.FFmpegUtils",
+      staticImports = "java.util.concurrent.TimeUnit.MILLISECONDS")
+  public static String millisecondsToString(long milliseconds) {
+    return toTimecode(milliseconds, MILLISECONDS);
+  }
+
+  /**
+   * Convert the duration to "hh:mm:ss" timecode representation, where ss (seconds) can be decimal.
+   *
+   * @param duration the duration.
+   * @param units the unit the duration is in.
+   * @return the timecode representation.
+   */
+  public static String toTimecode(long duration, TimeUnit units) {
+    String prefix = "";
+    if (duration < 0) {
+      prefix = "-";
+      duration = Math.abs(duration);
+    }
+
+    long nanoseconds = units.toNanos(duration); // TODO: This will clip at Long.MAX_VALUE
+    long seconds = units.toSeconds(duration);
+    long ns = nanoseconds - SECONDS.toNanos(seconds);
+
+    long minutes = SECONDS.toMinutes(seconds);
+    seconds -= MINUTES.toSeconds(minutes);
+
+    long hours = MINUTES.toHours(minutes);
+    minutes -= HOURS.toMinutes(hours);
+
+    String result;
+    if (ns == 0) {
+      result = String.format("%02d:%02d:%02d", hours, minutes, seconds);
+    } else {
+      result =
+          ZERO.trimTrailingFrom(String.format("%02d:%02d:%02d.%09d", hours, minutes, seconds, ns));
+    }
+
+    return prefix + result;
+  }
+
+  /**
+   * Converts milliseconds to a seconds string representation. Uses integer format when there are no
+   * fractional seconds, otherwise uses decimal format with up to 3 decimal places and trailing
+   * zeros removed.
+   *
+   * @param millis duration in milliseconds
+   * @return seconds as a string (e.g. "5", "0.005", "1.5")
+   */
+  public static String millisToSeconds(long millis) {
+    if (millis % 1000 == 0) {
+      return String.valueOf(millis / 1000);
+    }
+    // Use up to 3 decimal places, trim trailing zeros
+    String s = String.format("%.3f", millis / 1000.0);
+    s = s.contains(".") ? s.replaceAll("0+$", "").replaceAll("\\.$", "") : s;
+    return s;
+  }
+
+  /**
+   * Returns the number of nanoseconds this timecode represents. The string is expected to be in the
+   * format "hour:minute:second", where second can be a decimal number.
+   *
+   * @param time the timecode to parse.
+   * @return the number of nanoseconds or -1 if time is 'N/A'
+   */
+  public static long fromTimecode(String time) {
+    checkNotEmpty(time, "time must not be empty string");
+
+    if (time.equals("N/A")) {
+      return -1;
+    }
+
+    Matcher m = TIME_REGEX.matcher(time);
+    if (!m.find()) {
+      throw new IllegalArgumentException("invalid time '" + time + "'");
+    }
+
+    long sign = m.group(1).equals("-") ? -1 : 1;
+    long hours = Long.parseLong(m.group(2));
+    long mins = Long.parseLong(m.group(3));
+    double secs = Double.parseDouble(m.group(4));
+
+    return sign
+        * (HOURS.toNanos(hours) + MINUTES.toNanos(mins) + (long) (SECONDS.toNanos(1) * secs));
+  }
+
+  /**
+   * Converts a string representation of bitrate to a long of bits per second.
+   *
+   * @param bitrate in the form of 12.3kbits/s
+   * @return the bitrate in bits per second or -1 if bitrate is 'N/A'
+   */
+  public static long parseBitrate(String bitrate) {
+    checkNotEmpty(bitrate, "bitrate must not be empty string");
+
+    if ("N/A".equals(bitrate)) {
+      return -1;
+    }
+    Matcher m = BITRATE_REGEX.matcher(bitrate);
+    if (!m.find()) {
+      throw new IllegalArgumentException("Invalid bitrate '" + bitrate + "'");
+    }
+
+    return (long) (Float.parseFloat(m.group(1)) * 1000);
+  }
+
+  static Gson getGson() {
+    return gson;
+  }
+
+  private static Gson setupGson() {
+    GsonBuilder builder = new GsonBuilder();
+
+    builder.registerTypeAdapterFactory(new LowercaseEnumTypeAdapterFactory());
+    builder.registerTypeAdapter(Fraction.class, new FractionAdapter());
+    builder.registerTypeAdapter(FFmpegFrameOrPacket.class, new FFmpegPacketsAndFramesAdapter());
+    builder.registerTypeAdapter(FFmpegStream.SideData.class, new FFmpegStreamSideDataAdapter());
+
+    return builder.create();
+  }
+}
